@@ -3,6 +3,7 @@
  * Features: Temperature & pH monitoring, Automatic feeding, Peltier cooling with PID
  * Board: ESP32-S3-DEVKITC-1
  * Framework: Arduino
+ * Version: 2.0 - Updated with non-blocking WiFi and centralized LCD
  */
 
 #include <WiFi.h>
@@ -59,6 +60,7 @@
 #define TEMP_TARGET_MAX 30.0
 #define TEMP_TARGET_DEFAULT 27.0
 #define TEMP_HYSTERESIS 0.5
+#define TEMP_STEP 1.0
 
 // Peltier PWM Settings (0-255)
 #define PELTIER_IDLE_PWM 77 // 30% of 255
@@ -88,9 +90,21 @@
 #define LCD_UPDATE_INTERVAL 1000
 
 // LCD Configuration
-#define LCD_ADDRESS 0x27 // Common I2C address, change if needed
+#define LCD_ADDRESS 0x27 // Common I2C address, change to 0x3F if needed
 #define LCD_COLS 20
 #define LCD_ROWS 4
+
+// WiFi & MQTT Retry Settings
+#define WIFI_RETRY_INTERVAL 30000
+#define MQTT_RETRY_INTERVAL 5000
+#define NTP_SYNC_INTERVAL 3600000    // Resync every hour
+#define WIFI_RECONNECT_TIMEOUT 10000 // 10 seconds max
+
+// LCD Temporary Message Duration
+#define TEMP_MESSAGE_DURATION 3000 // 3 seconds
+
+// Button Debounce
+#define DEBOUNCE_DELAY 50
 
 // ============================================
 // GLOBAL OBJECTS
@@ -127,12 +141,34 @@ bool mqttConnected = false;
 bool timesynced = false;
 bool feedingInProgress = false;
 
+// WiFi Reconnection State Machine
+enum WiFiReconnectState
+{
+  WIFI_IDLE,
+  WIFI_DISCONNECTING,
+  WIFI_CONNECTING
+};
+
+WiFiReconnectState wifiReconnectState = WIFI_IDLE;
+unsigned long wifiReconnectStartTime = 0;
+
+// LCD Display Mode Management
+enum LCDDisplayMode
+{
+  LCD_NORMAL,       // Normal sensor display
+  LCD_TEMP_MESSAGE, // Temporary message with timer
+  LCD_STARTUP       // During startup phase
+};
+
+LCDDisplayMode lcdMode = LCD_STARTUP;
+String tempMessage = "";
+unsigned long tempMessageStartTime = 0;
+
 // Button States
 bool tempUpPressed = false;
 bool tempDownPressed = false;
 bool manualFeedPressed = false;
 unsigned long lastDebounceTime = 0;
-#define DEBOUNCE_DELAY 50
 
 // Feeding Tracking
 bool fed1Today = false;
@@ -148,32 +184,46 @@ unsigned long lastWifiAttempt = 0;
 unsigned long lastMqttAttempt = 0;
 unsigned long lastNtpSync = 0;
 
-#define WIFI_RETRY_INTERVAL 30000
-#define MQTT_RETRY_INTERVAL 5000
-#define NTP_SYNC_INTERVAL 3600000 // Resync every hour
-
 // ============================================
 // FUNCTION DECLARATIONS
 // ============================================
 
+// Setup Functions
 void setupWiFi();
 void setupMQTT();
 void setupSensors();
 void setupActuators();
 void setupLCD();
 void syncTimeWithNTP();
+
+// Connection Management
 void reconnectWiFi();
 void reconnectMQTT();
 void mqttCallback(char *topic, byte *payload, unsigned int length);
+
+// Sensor Functions
 void readTemperature();
 void readPH();
-void controlPeltier();
+
+// Control Functions
+void handlePeltierControl();
+
+// Feeding Functions
 void checkScheduledFeeding();
 void performFeeding(const char *source);
+
+// Input Handling
 void checkButtons();
+
+// LCD Display Functions
 void updateLCD();
+void displayNormalStatus();
+void setLCDTempMessage(const char *line1, const char *line2 = "",
+                       const char *line3 = "", const char *line4 = "");
+void setLCDNormalMode();
+
+// MQTT Functions
 void publishSensorData();
-void handlePeltierControl();
 
 // ============================================
 // SETUP
@@ -199,6 +249,8 @@ void setup()
 
   // Initialize LCD
   setupLCD();
+  lcdMode = LCD_STARTUP; // Prevent updateLCD() from interfering during setup
+
   lcd.clear();
   lcd.setCursor(0, 0);
   lcd.print("AQUASENSE V2");
@@ -216,7 +268,7 @@ void setup()
   tempPID.SetOutputLimits(0, 255);
   tempPID.SetSampleTime(1000);
 
-  // Connect to WiFi
+  // Connect to WiFi (non-blocking with short timeout)
   setupWiFi();
 
   // Setup MQTT
@@ -228,9 +280,12 @@ void setup()
     syncTimeWithNTP();
   }
 
-  lcd.setCursor(0, 1);
-  lcd.print("Ready!              ");
+  // Show ready message for 2 seconds
+  setLCDTempMessage("AQUASENSE V2", "System Ready!", "Starting...");
   delay(2000);
+
+  // Switch to normal display mode
+  setLCDNormalMode();
 
   Serial.println("\n=================================");
   Serial.println("AQUASENSE V2 - Ready!");
@@ -253,6 +308,11 @@ void loop()
       reconnectWiFi();
       lastWifiAttempt = currentMillis;
     }
+  }
+  else
+  {
+    // Check if still connected
+    reconnectWiFi();
   }
 
   // Handle MQTT Connection
@@ -338,9 +398,12 @@ void setupSensors()
 {
   // DS18B20 Temperature Sensor
   tempSensor.begin();
+  tempSensor.setResolution(12); // Set to 12-bit resolution (0.0625°C precision)
+
   Serial.print("[DS18B20] Found ");
   Serial.print(tempSensor.getDeviceCount());
   Serial.println(" device(s)");
+  Serial.println("[DS18B20] Resolution set to 12-bit (0.0625°C)");
 
   // pH Sensor
   phSensor.begin();
@@ -360,14 +423,12 @@ void setupWiFi()
   Serial.print("[WiFi] Connecting to ");
   Serial.println(WIFI_SSID);
 
-  lcd.setCursor(0, 2);
-  lcd.print("WiFi: Connecting... ");
-
   WiFi.mode(WIFI_STA);
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
 
+  // Try for 2 seconds only (non-blocking approach)
   int attempts = 0;
-  while (WiFi.status() != WL_CONNECTED && attempts < 20)
+  while (WiFi.status() != WL_CONNECTED && attempts < 4)
   {
     delay(500);
     Serial.print(".");
@@ -381,16 +442,13 @@ void setupWiFi()
     Serial.println("\n[WiFi] Connected!");
     Serial.print("[WiFi] IP Address: ");
     Serial.println(WiFi.localIP());
-
-    lcd.setCursor(0, 2);
-    lcd.print("WiFi: Connected     ");
   }
   else
   {
     wifiConnected = false;
-    Serial.println("\n[WiFi] Connection failed!");
-    lcd.setCursor(0, 2);
-    lcd.print("WiFi: Failed        ");
+    digitalWrite(PIN_LED_INDICATOR, LOW);
+    Serial.println("\n[WiFi] Not connected yet, will retry in background");
+    // loop() will keep trying via reconnectWiFi()
   }
 }
 
@@ -447,37 +505,77 @@ void syncTimeWithNTP()
 
 void reconnectWiFi()
 {
+  unsigned long currentMillis = millis();
+
+  // Check if already connected
   if (WiFi.status() == WL_CONNECTED)
   {
-    wifiConnected = true;
-    digitalWrite(PIN_LED_INDICATOR, HIGH);
+    if (!wifiConnected)
+    {
+      // Just became connected
+      wifiConnected = true;
+      digitalWrite(PIN_LED_INDICATOR, HIGH);
+      Serial.println("[WiFi] Connection detected!");
+    }
+    wifiReconnectState = WIFI_IDLE;
     return;
   }
 
-  Serial.println("[WiFi] Attempting to reconnect...");
-  WiFi.disconnect();
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-
-  int attempts = 0;
-  while (WiFi.status() != WL_CONNECTED && attempts < 10)
-  {
-    delay(500);
-    attempts++;
-  }
-
-  if (WiFi.status() == WL_CONNECTED)
-  {
-    wifiConnected = true;
-    digitalWrite(PIN_LED_INDICATOR, HIGH);
-    Serial.println("[WiFi] Reconnected!");
-
-    // Resync time after reconnection
-    syncTimeWithNTP();
-  }
-  else
+  // Not connected anymore
+  if (wifiConnected)
   {
     wifiConnected = false;
     digitalWrite(PIN_LED_INDICATOR, LOW);
+    Serial.println("[WiFi] Connection lost!");
+  }
+
+  // State machine for non-blocking reconnection
+  switch (wifiReconnectState)
+  {
+  case WIFI_IDLE:
+    // Start reconnection process
+    Serial.println("[WiFi] Attempting to reconnect...");
+    WiFi.disconnect();
+    wifiReconnectState = WIFI_DISCONNECTING;
+    wifiReconnectStartTime = currentMillis;
+    break;
+
+  case WIFI_DISCONNECTING:
+    // Wait a bit for clean disconnect
+    if (currentMillis - wifiReconnectStartTime >= 500)
+    {
+      WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+      wifiReconnectState = WIFI_CONNECTING;
+      wifiReconnectStartTime = currentMillis;
+      Serial.println("[WiFi] Connection initiated...");
+    }
+    break;
+
+  case WIFI_CONNECTING:
+    // Check connection status
+    if (WiFi.status() == WL_CONNECTED)
+    {
+      wifiConnected = true;
+      wifiReconnectState = WIFI_IDLE;
+      digitalWrite(PIN_LED_INDICATOR, HIGH);
+      Serial.println("[WiFi] Reconnected!");
+      Serial.print("[WiFi] IP Address: ");
+      Serial.println(WiFi.localIP());
+
+      // Show brief reconnection message
+      setLCDTempMessage("AQUASENSE V2", "WiFi Reconnected!", WiFi.localIP().toString().c_str());
+
+      syncTimeWithNTP();
+    }
+    // Timeout if taking too long
+    else if (currentMillis - wifiReconnectStartTime >= WIFI_RECONNECT_TIMEOUT)
+    {
+      wifiConnected = false;
+      wifiReconnectState = WIFI_IDLE;
+      digitalWrite(PIN_LED_INDICATOR, LOW);
+      Serial.println("[WiFi] Reconnection timeout!");
+    }
+    break;
   }
 }
 
@@ -511,6 +609,9 @@ void reconnectMQTT()
 
     // Publish online status
     mqttClient.publish(TOPIC_STATUS, "{\"status\":\"online\"}");
+
+    // Show brief connection message
+    setLCDTempMessage("AQUASENSE V2", "MQTT Connected!");
   }
   else
   {
@@ -543,7 +644,7 @@ void mqttCallback(char *topic, byte *payload, unsigned int length)
   {
     if (message == "1" || message == "true" || message.equalsIgnoreCase("feed"))
     {
-      performFeeding("MQTT");
+      performFeeding("MQTT Command");
     }
   }
 
@@ -557,6 +658,11 @@ void mqttCallback(char *topic, byte *payload, unsigned int length)
       Serial.print("[Temp] Target updated to: ");
       Serial.print(targetTemp);
       Serial.println("°C via MQTT");
+
+      // Show confirmation on LCD
+      char msg[20];
+      sprintf(msg, "New Target: %.1fC", targetTemp);
+      setLCDTempMessage("AQUASENSE V2", msg, "Via MQTT");
     }
     else
     {
@@ -616,21 +722,16 @@ void handlePeltierControl()
   {
     // Temperature at target - maintain with idle power
     analogWrite(PIN_PELTIER_PWM, PELTIER_IDLE_PWM);
-    // Serial.println("[Peltier] Maintenance mode (30%)");
   }
   else if (tempDiff < 0)
   {
     // Current temp > target - need cooling
     analogWrite(PIN_PELTIER_PWM, (int)peltierOutput);
-    // Serial.print("[Peltier] Cooling mode: ");
-    // Serial.print((int)peltierOutput);
-    // Serial.println(" PWM");
   }
   else
   {
     // Current temp < target - idle/low power (no heating)
     analogWrite(PIN_PELTIER_PWM, PELTIER_IDLE_PWM);
-    // Serial.println("[Peltier] Idle mode (target higher than current)");
   }
 }
 
@@ -652,14 +753,14 @@ void checkScheduledFeeding()
   // Check first feeding time (8:00 AM)
   if (!fed1Today && currentHour == FEED_TIME_1_HOUR && currentMin == FEED_TIME_1_MIN)
   {
-    performFeeding("Schedule 1");
+    performFeeding("Schedule 08:00");
     fed1Today = true;
   }
 
   // Check second feeding time (8:00 PM)
   if (!fed2Today && currentHour == FEED_TIME_2_HOUR && currentMin == FEED_TIME_2_MIN)
   {
-    performFeeding("Schedule 2");
+    performFeeding("Schedule 20:00");
     fed2Today = true;
   }
 
@@ -685,8 +786,8 @@ void performFeeding(const char *source)
   Serial.print("[Feeding] Feeding triggered by: ");
   Serial.println(source);
 
-  lcd.setCursor(0, 3);
-  lcd.print("Feeding...          ");
+  // Show feeding message on LCD
+  setLCDTempMessage("AQUASENSE V2", "FEEDING NOW!", source);
 
   // Move servo to feed position
   feedServo.write(SERVO_FEED_ANGLE);
@@ -707,6 +808,7 @@ void performFeeding(const char *source)
   }
 
   feedingInProgress = false;
+  // LCD will auto-return to normal display after 3 seconds
 }
 
 // ============================================
@@ -731,10 +833,19 @@ void checkButtons()
 
     if (targetTemp < TEMP_TARGET_MAX)
     {
-      targetTemp += 0.5;
+      targetTemp += TEMP_STEP;
       Serial.print("[Button] Target temp increased to: ");
       Serial.print(targetTemp);
       Serial.println("°C");
+
+      // Show confirmation on LCD
+      char msg[20];
+      sprintf(msg, "Target: %.1fC", targetTemp);
+      setLCDTempMessage("AQUASENSE V2", "Temp Increased", msg);
+    }
+    else
+    {
+      setLCDTempMessage("AQUASENSE V2", "Max Temp Reached", "30.0C");
     }
   }
   else if (digitalRead(PIN_TEMP_UP_BTN) == HIGH)
@@ -750,10 +861,19 @@ void checkButtons()
 
     if (targetTemp > TEMP_TARGET_MIN)
     {
-      targetTemp -= 0.5;
+      targetTemp -= TEMP_STEP;
       Serial.print("[Button] Target temp decreased to: ");
       Serial.print(targetTemp);
       Serial.println("°C");
+
+      // Show confirmation on LCD
+      char msg[20];
+      sprintf(msg, "Target: %.1fC", targetTemp);
+      setLCDTempMessage("AQUASENSE V2", "Temp Decreased", msg);
+    }
+    else
+    {
+      setLCDTempMessage("AQUASENSE V2", "Min Temp Reached", "25.0C");
     }
   }
   else if (digitalRead(PIN_TEMP_DOWN_BTN) == HIGH)
@@ -775,12 +895,44 @@ void checkButtons()
 }
 
 // ============================================
-// LCD DISPLAY
+// LCD DISPLAY FUNCTIONS
 // ============================================
 
 void updateLCD()
 {
-  // Row 0: Title and WiFi status
+  unsigned long currentMillis = millis();
+
+  // Check if temporary message expired
+  if (lcdMode == LCD_TEMP_MESSAGE)
+  {
+    if (currentMillis - tempMessageStartTime >= TEMP_MESSAGE_DURATION)
+    {
+      lcdMode = LCD_NORMAL; // Return to normal display
+      lcd.clear();          // Clear old message
+    }
+  }
+
+  switch (lcdMode)
+  {
+  case LCD_STARTUP:
+    // Don't update during startup - manual control
+    break;
+
+  case LCD_TEMP_MESSAGE:
+    // Show temporary message (already displayed by setLCDTempMessage)
+    // Just wait for timeout
+    break;
+
+  case LCD_NORMAL:
+    // Normal operation display
+    displayNormalStatus();
+    break;
+  }
+}
+
+void displayNormalStatus()
+{
+  // Row 0: Title and connection status
   lcd.setCursor(0, 0);
   lcd.print("AQUASENSE V2 ");
   lcd.print(wifiConnected ? "W" : " ");
@@ -818,6 +970,41 @@ void updateLCD()
   {
     lcd.print("Time: Not synced    ");
   }
+}
+
+void setLCDTempMessage(const char *line1, const char *line2,
+                       const char *line3, const char *line4)
+{
+  lcdMode = LCD_TEMP_MESSAGE;
+  tempMessageStartTime = millis();
+
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print(line1);
+
+  if (strlen(line2) > 0)
+  {
+    lcd.setCursor(0, 1);
+    lcd.print(line2);
+  }
+
+  if (strlen(line3) > 0)
+  {
+    lcd.setCursor(0, 2);
+    lcd.print(line3);
+  }
+
+  if (strlen(line4) > 0)
+  {
+    lcd.setCursor(0, 3);
+    lcd.print(line4);
+  }
+}
+
+void setLCDNormalMode()
+{
+  lcdMode = LCD_NORMAL;
+  lcd.clear();
 }
 
 // ============================================
