@@ -1,16 +1,8 @@
-/*
- * AQUASENSE V2 - IoT Aquarium Smart Monitoring System
- * Features: Temperature & pH monitoring, Automatic feeding, Peltier cooling with PID
- * Board: ESP32-S3-DEVKITC-1
- * Framework: Arduino
- * Version: 2.0 - Updated with non-blocking WiFi and centralized LCD
- */
-
 #include <WiFi.h>
 #include <PubSubClient.h>
 #include <OneWire.h>
 #include <DallasTemperature.h>
-#include <DFRobot_ESP_PH.h>
+#include <DFRobot_ESP_PH_Preferences.h>
 #include <ESP32Servo.h>
 #include <LiquidCrystal_I2C.h>
 #include <time.h>
@@ -252,9 +244,9 @@ void setup()
   lcdMode = LCD_STARTUP; // Prevent updateLCD() from interfering during setup
 
   lcd.clear();
-  lcd.setCursor(0, 0);
+  lcd.setCursor(4, 2);
   lcd.print("AQUASENSE V2");
-  lcd.setCursor(0, 1);
+  lcd.setCursor(2, 3);
   lcd.print("Initializing...");
 
   // Initialize Sensors
@@ -407,6 +399,8 @@ void setupSensors()
 
   // pH Sensor
   phSensor.begin();
+  analogReadResolution(12);       // 12-bit ADC resolution
+  analogSetAttenuation(ADC_11db); // Full-scale voltage 3.3V
   Serial.println("[PH Sensor] Initialized");
 }
 
@@ -696,7 +690,8 @@ void readTemperature()
 
 void readPH()
 {
-  voltage = analogRead(PIN_PH_SENSOR) / 4095.0 * 3300; // ESP32 ADC: 12-bit, 3.3V
+  int rawADC = analogRead(PIN_PH_SENSOR);
+  voltage = analogReadMilliVolts(PIN_PH_SENSOR); // ESP32 ADC: 12-bit, 3.3V
   phValue = phSensor.readPH(voltage, temperature);
 
   Serial.print("[PH Sensor] pH: ");
