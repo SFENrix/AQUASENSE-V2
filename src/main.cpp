@@ -2,7 +2,8 @@
 #include <PubSubClient.h>
 #include <OneWire.h>
 #include <DallasTemperature.h>
-#include <DFRobot_ESP_PH_Preferences.h>
+#include <DFRobot_ESP_PH.h> // Greenponik pH library
+#include <EEPROM.h>         // For reading pH calibration data
 #include <ESP32Servo.h>
 #include <LiquidCrystal_I2C.h>
 #include <time.h>
@@ -13,14 +14,14 @@
 // ============================================
 
 // WiFi Credentials
-#define WIFI_SSID "YOUR_WIFI_SSID"
-#define WIFI_PASSWORD "YOUR_WIFI_PASSWORD"
+#define WIFI_SSID "CIEEE"
+#define WIFI_PASSWORD "FENRIRGIMANK"
 
 // MQTT Configuration
-#define MQTT_BROKER "mqtt.example.com"
+#define MQTT_BROKER "mqtt.emqx.io"
 #define MQTT_PORT 1883
-#define MQTT_USER "your_username" // Leave empty if no auth
-#define MQTT_PASSWORD "your_password"
+#define MQTT_USER "" // Leave empty if no auth
+#define MQTT_PASSWORD ""
 #define MQTT_CLIENT_ID "AquasenseV2"
 
 // MQTT Topics
@@ -46,6 +47,13 @@
 #define PIN_TEMP_DOWN_BTN 47
 #define PIN_MANUAL_FEED_BTN 2
 #define PIN_PELTIER_PWM 21
+
+// EEPROM Configuration for pH Calibration
+#define EEPROM_SIZE 32 // Size needed for pH calibration storage
+
+// ESP32-S3 ADC Configuration
+#define ESP32_ADC_RESOLUTION 4096.0 // 12-bit ADC (2^12)
+#define ESP32_VOLTAGE_REF 3300      // 3.3V reference in millivolts
 
 // Temperature Settings
 #define TEMP_TARGET_MIN 25.0
@@ -107,7 +115,7 @@ PubSubClient mqttClient(espClient);
 
 OneWire oneWire(PIN_DS18B20);
 DallasTemperature tempSensor(&oneWire);
-DFRobot_ESP_PH phSensor;
+DFRobot_ESP_PH phSensor; // Greenponik pH sensor object
 
 Servo feedServo;
 LiquidCrystal_I2C lcd(LCD_ADDRESS, LCD_COLS, LCD_ROWS);
@@ -228,6 +236,10 @@ void setup()
   Serial.println("\n\n=================================");
   Serial.println("AQUASENSE V2 - Starting...");
   Serial.println("=================================\n");
+
+  // Initialize EEPROM to read pH calibration data
+  EEPROM.begin(EEPROM_SIZE);
+  Serial.println("[EEPROM] Initialized - Reading pH calibration data");
 
   // Initialize Pin Modes
   pinMode(PIN_LED_INDICATOR, OUTPUT);
@@ -397,11 +409,17 @@ void setupSensors()
   Serial.println(" device(s)");
   Serial.println("[DS18B20] Resolution set to 12-bit (0.0625°C)");
 
-  // pH Sensor
+  // pH Sensor - Greenponik library initialization
+  // This automatically loads calibration data from EEPROM
   phSensor.begin();
-  analogReadResolution(12);       // 12-bit ADC resolution
+
+  // Configure ESP32-S3 ADC
+  analogReadResolution(12);       // 12-bit ADC resolution (0-4095)
   analogSetAttenuation(ADC_11db); // Full-scale voltage 3.3V
-  Serial.println("[PH Sensor] Initialized");
+
+  Serial.println("[pH Sensor] Greenponik library initialized");
+  Serial.println("[pH Sensor] Calibration data loaded from EEPROM");
+  Serial.println("[pH Sensor] ADC: 12-bit resolution, 3.3V reference");
 }
 
 void setupActuators()
@@ -690,15 +708,23 @@ void readTemperature()
 
 void readPH()
 {
+  // Read ADC value and convert to millivolts
   int rawADC = analogRead(PIN_PH_SENSOR);
-  voltage = analogReadMilliVolts(PIN_PH_SENSOR); // ESP32 ADC: 12-bit, 3.3V
+  voltage = analogReadMilliVolts(PIN_PH_SENSOR); // Direct millivolt reading
+
+  // Calculate pH using Greenponik library with temperature compensation
+  // Library automatically uses calibration data loaded from EEPROM
   phValue = phSensor.readPH(voltage, temperature);
 
-  Serial.print("[PH Sensor] pH: ");
-  Serial.print(phValue, 2);
+  Serial.print("[pH Sensor] Raw ADC: ");
+  Serial.print(rawADC);
   Serial.print(" | Voltage: ");
   Serial.print(voltage, 2);
-  Serial.println("mV");
+  Serial.print("mV | pH: ");
+  Serial.print(phValue, 2);
+  Serial.print(" | Temp: ");
+  Serial.print(temperature, 1);
+  Serial.println("°C");
 }
 
 // ============================================
