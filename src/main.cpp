@@ -7,17 +7,48 @@
 #include <ESP32Servo.h>
 #include <LiquidCrystal_I2C.h>
 #include <time.h>
+#include <ArduinoJson.h>
 
-// ============================================
-// CONFIGURATION
-// ============================================
+// WIFI CONFIGURATION
 
 #define WIFI_SSID "CIEEE"
 #define WIFI_PASSWORD "FENRIRGIMANK"
-#define MQTT_BROKER "broker.emqx.io"
-#define MQTT_PORT 1883
-#define MQTT_USER ""
-#define MQTT_PASSWORD ""
+
+// THINGSBOARD MQTT CONFIG
+
+#define TB_ENABLED true // Set to false to disable ThingsBoard (for basic pack)
+#define TB_SERVER "thingsboard.cloud"
+#define TB_PORT 1883
+#define TB_TOKEN "er0x5rqcdq1x81mzumls" // GET FROM THINGSBOARD CLOUD WEB
+#define TB_TELEMETRY_TOPIC "v1/devices/me/telemetry"
+#define TB_ATTRIBUTES_TOPIC "v1/devices/me/attributes"
+#define TB_RPC_SUBSCRIBE_TOPIC "v1/devices/me/rpc/request/+"
+#define TB_PUBLISH_INTERVAL 10000
+
+// EMQX MQTT CONFIGURATION
+
+#define EMQX_ENABLED true // setting to false will disable EMQX broker (for Flutter app)
+#define EMQX_SERVER "broker.emqx.io"
+#define EMQX_PORT 1883
+#define EMQX_USER ""
+#define EMQX_PASSWORD ""
+#define EMQX_PUBLISH_INTERVAL 5000
+
+// EMQX Topics (for Flutter App)
+
+#define TOPIC_TEMP "aquasense/sensor/temperature"
+#define TOPIC_PH "aquasense/sensor/ph"
+#define TOPIC_TEMP_TARGET "aquasense/sensor/target_temp"
+#define TOPIC_STATUS "aquasense/status"
+#define TOPIC_CMD_FEED_REQ "aquasense/command/feed/request"
+#define TOPIC_CMD_FEED_RES "aquasense/command/feed/response"
+#define TOPIC_CMD_PELTIER_REQ "aquasense/command/peltier/request"
+#define TOPIC_CMD_PELTIER_RES "aquasense/command/peltier/response"
+#define TOPIC_CMD_TEMP_ADJUST_REQ "aquasense/command/temp_adjust/request"
+#define TOPIC_CMD_TEMP_ADJUST_RES "aquasense/command/temp_adjust/response"
+#define TOPIC_CMD_SETTEMP_REQ "aquasense/command/settemp/request"
+#define TOPIC_CMD_SETTEMP_RES "aquasense/command/settemp/response"
+#define TOPIC_EVENT_FEEDING "aquasense/event/feeding"
 
 // Pin Definitions
 #define PIN_PH_SENSOR 4
@@ -31,40 +62,26 @@
 #define PIN_MANUAL_FEED_BTN 13
 #define PIN_PELTIER_PWM 21
 
-// MQTT Topics
-#define TOPIC_TEMP "aquasense/sensor/temperature"
-#define TOPIC_PH "aquasense/sensor/ph"
-#define TOPIC_TEMP_TARGET "aquasense/sensor/target_temp"
-#define TOPIC_STATUS "aquasense/status"
-#define TOPIC_CMD_FEED_REQ "aquasense/command/feed/request"
-#define TOPIC_CMD_FEED_RES "aquasense/command/feed/response"
-#define TOPIC_CMD_PELTIER_REQ "aquasense/command/peltier/request"
-#define TOPIC_CMD_PELTIER_RES "aquasense/command/peltier/response"
-#define TOPIC_CMD_TEMP_ADJUST_REQ "aquasense/command/temp_adjust/request"
-#define TOPIC_CMD_TEMP_ADJUST_RES "aquasense/command/temp_adjust/response"
-#define TOPIC_CMD_SETTEMP_REQ "aquasense/command/settemp/request"
-#define TOPIC_CMD_SETTEMP_RES "aquasense/command/settemp/response"
-
-// Temperature Settings
+// Peltier Control Settings
 #define TEMP_TARGET_MIN 25.0
 #define TEMP_TARGET_MAX 30.0
 #define TEMP_TARGET_DEFAULT 27.0
 #define TEMP_HYSTERESIS 0.5
 #define TEMP_STEP 1.0
 
-// Sensor Validation Ranges
+// Sensor Validation
 #define TEMP_MIN_VALID -55.0
 #define TEMP_MAX_VALID 125.0
 #define TEMP_ERROR_VALUE -127.0
 #define PH_MIN_VALID 0.0
 #define PH_MAX_VALID 14.0
 
-// Buffer Sizes (INCREASED FOR SAFETY)
+// Buffer Sizes
 #define LCD_BUFFER_SIZE 64
-#define MQTT_BUFFER_SIZE 256
+#define MQTT_BUFFER_SIZE 512
 #define TEMP_STR_SIZE 16
 
-// Peltier PWM Configuration
+// Peltier Configuration
 #define PELTIER_PWM_CHANNEL 4
 #define PELTIER_PWM_FREQ 25000
 #define PELTIER_PWM_RESOLUTION 8
@@ -74,9 +91,8 @@
 
 // Servo Configuration
 #define SERVO_FEED_ANGLE 30
-#define SERVO_FEED_DURATION 500
+#define SERVO_FEED_DURATION 75
 #define SERVO_REST_ANGLE 0
-#define SERVO_DETACH_DELAY 2000
 
 // Feeding Schedule
 #define FEED_TIME_1_HOUR 8
@@ -89,18 +105,14 @@
 #define LCD_COLS 20
 #define LCD_ROWS 4
 
-// Startup Optimization
+// Startup Settings
 #define WIFI_CONNECT_TIMEOUT 4
 #define STARTUP_SCREEN_DELAY 1000
-#define READY_SCREEN_DELAY 1000
+#define READY_SCREEN_DELAY 2000
 
-// MQTT Reconnection Settings
+// MQTT Settings
 #define MQTT_CONNECT_TIMEOUT 5000
 #define MQTT_MAX_RETRY_COUNT 10
-
-// ============================================
-// STATE DEFINITIONS
-// ============================================
 
 // WiFi States
 #define WIFI_STATE_CONNECTED 0
@@ -113,40 +125,42 @@
 #define MQTT_STATE_CONNECTING 2
 #define MQTT_STATE_WAITING_RETRY 3
 
-// LCD Display Modes
+// LCD Modes
 #define LCD_MODE_NORMAL 0
 #define LCD_MODE_TEMP_MESSAGE 1
 #define LCD_MODE_STARTUP 2
 
-// ============================================
-// GLOBAL OBJECTS
-// ============================================
+// =====GLOBAL OBJECTS=====
 
-WiFiClient espClient;
-PubSubClient mqttClient(espClient);
+// WiFi Clients (separate for each broker)
+WiFiClient espClientTB;   // ThingsBoard WiFi client
+WiFiClient espClientEMQX; // EMQX WiFi client
+
+// MQTT Clients
+PubSubClient mqttClientTB(espClientTB);     // ThingsBoard MQTT
+PubSubClient mqttClientEMQX(espClientEMQX); // EMQX MQTT
+
+// Sensors and Actuators
 OneWire oneWire(PIN_DS18B20);
 DallasTemperature tempSensor(&oneWire);
 DFRobot_ESP_PH phSensor;
 Servo feedServo;
 LiquidCrystal_I2C lcd(LCD_ADDRESS, LCD_COLS, LCD_ROWS);
 
-// ============================================
-// GLOBAL VARIABLES
-// ============================================
+// =====GLOBAL VARIABLES=====
 
 // Sensor Data
 float temperature = 0.0;
 float phValue = 0.0;
 float voltage = 0.0;
 float targetTemp = TEMP_TARGET_DEFAULT;
-
-// Last Valid Readings (for fallback)
 float lastValidTemp = 25.0;
 float lastValidPH = 7.0;
 
 // System Status
 bool wifiConnected = false;
-bool mqttConnected = false;
+bool mqttConnectedTB = false;
+bool mqttConnectedEMQX = false;
 bool timesynced = false;
 bool feedingInProgress = false;
 bool peltierOn = false;
@@ -156,11 +170,15 @@ bool peltierInitialized = false;
 uint8_t wifiState = WIFI_STATE_DISCONNECTED;
 unsigned long wifiReconnectStartTime = 0;
 
-// MQTT State
-uint8_t mqttState = MQTT_STATE_DISCONNECTED;
-unsigned long mqttReconnectStartTime = 0;
-unsigned long mqttLastRetryTime = 0;
-int mqttRetryCount = 0;
+// MQTT States (separate for each broker)
+uint8_t mqttStateTB = MQTT_STATE_DISCONNECTED;
+uint8_t mqttStateEMQX = MQTT_STATE_DISCONNECTED;
+unsigned long mqttReconnectStartTimeTB = 0;
+unsigned long mqttReconnectStartTimeEMQX = 0;
+unsigned long mqttLastRetryTimeTB = 0;
+unsigned long mqttLastRetryTimeEMQX = 0;
+int mqttRetryCountTB = 0;
+int mqttRetryCountEMQX = 0;
 
 // Servo Control
 bool servoMoving = false;
@@ -175,12 +193,13 @@ volatile bool pendingTempAdjustDown = false;
 volatile bool pendingTempSet = false;
 float pendingTempValue = 0.0;
 
-// Timing Variables
+// Timing
 unsigned long peltierStartTime = 0;
 unsigned long lastPeltierChange = 0;
 unsigned long lastTempRead = 0;
 unsigned long lastPhRead = 0;
-unsigned long lastMqttPublish = 0;
+unsigned long lastMqttPublishTB = 0;
+unsigned long lastMqttPublishEMQX = 0;
 unsigned long lastLcdUpdate = 0;
 unsigned long lastWifiAttempt = 0;
 unsigned long lastNtpSync = 0;
@@ -195,6 +214,7 @@ bool feedingBlinkState = true;
 bool fed1Today = false;
 bool fed2Today = false;
 int lastFeedDay = -1;
+static bool resetDoneToday = false;
 
 // LCD Display
 uint8_t lcdMode = LCD_MODE_STARTUP;
@@ -206,115 +226,62 @@ bool tempUpPressed = false;
 bool tempDownPressed = false;
 bool manualFeedPressed = false;
 
-// MQTT Client ID
-char mqttClientId[32];
+// MQTT Client IDs
+char mqttClientIdTB[32];
+char mqttClientIdEMQX[32];
 
-// ============================================
-// SENSOR VALIDATION FUNCTIONS
-// ============================================
+// =====FUNCTION DECLARATIONS=====
 
-float validateTemperature(float temp)
-{
-  // Check for DS18B20 error value
-  if (temp == TEMP_ERROR_VALUE)
-  {
-    Serial.println("⚠️ [TEMP] DS18B20 error value detected");
-    return lastValidTemp;
-  }
+// Sensor Validation
+float validateTemperature(float temp);
+float validatePH(float ph);
 
-  // Check valid range
-  if (temp < TEMP_MIN_VALID || temp > TEMP_MAX_VALID)
-  {
-    Serial.printf("⚠️ [TEMP] Out of range: %.2f°C\n", temp);
-    return lastValidTemp;
-  }
+// ThingsBoard Functions
+unsigned long getTimestampMillis();
+void publishTelemetryToThingsBoard(const char *key, float value);
+void publishSensorTelemetryToThingsBoard();
+void publishFeedingEventToThingsBoard(const char *source);
+void publishAttributesToThingsBoard();
 
-  // Valid reading - store and return
-  lastValidTemp = temp;
-  return temp;
-}
+// EMQX Functions
+void publishSensorDataToEMQX();
+void publishFeedingEventToEMQX(const char *status);
+void publishTargetTempToEMQX();
+void publishPeltierStatusToEMQX();
 
-float validatePH(float ph)
-{
-  // Check valid range
-  if (ph < PH_MIN_VALID || ph > PH_MAX_VALID)
-  {
-    Serial.printf("⚠️ [PH] Out of range: %.2f\n", ph);
-    return lastValidPH;
-  }
-
-  // Check for suspiciously low values
-  if (ph < 1.0)
-  {
-    Serial.printf("⚠️ [PH] Suspiciously low: %.2f\n", ph);
-    return lastValidPH;
-  }
-
-  // Valid reading - store and return
-  lastValidPH = ph;
-  return ph;
-}
-
-// ============================================
-// HELPER FUNCTIONS
-// ============================================
-
-unsigned long getMQTTRetryInterval(int retryCount)
-{
-  if (retryCount == 0)
-    return 5000;
-  if (retryCount == 1)
-    return 10000;
-  if (retryCount == 2)
-    return 20000;
-  return 30000;
-}
-
-// Safe string formatting with bounds checking
-void safeFloatToStr(char *buffer, size_t bufferSize, float value, int width, int precision)
-{
-  if (bufferSize < 2)
-    return;
-
-  // Format with snprintf for safety
-  int written = snprintf(buffer, bufferSize, "%*.*f", width, precision, value);
-
-  // Check for truncation
-  if (written >= (int)bufferSize)
-  {
-    Serial.println("⚠️ [BUFFER] String truncated in safeFloatToStr");
-  }
-}
-
-// ============================================
-// FUNCTION DECLARATIONS
-// ============================================
-
-void setupWiFi();
+// MQTT Management
 void setupMQTT();
+void checkMQTTConnectionTB();
+void checkMQTTConnectionEMQX();
+void reconnectMQTTTB();
+void reconnectMQTTEMQX();
+const char *getMQTTStateDescription(int state);
+void mqttCallbackTB(char *topic, byte *payload, unsigned int length);
+void mqttCallbackEMQX(char *topic, byte *payload, unsigned int length);
+
+// Setup Functions
+void setupWiFi();
 void setupSensors();
 void setupActuators();
 void setupLCD();
 void syncTimeWithNTPBackground();
 void smartPeltierStartup();
+
+// WiFi Management
 void reconnectWiFi();
-void checkMQTTConnection();
-void reconnectMQTT();
-const char *getMQTTStateDescription(int state);
-void mqttCallback(char *topic, byte *payload, unsigned int length);
+
+// Core Functions
 void processDeferredActions();
 void adjustTargetTemp(int direction);
 void setTargetTemp(float newTemp);
 bool isValidTargetTemp(float temp);
-void publishTargetTemp();
 void setPeltierState(bool state);
-void publishPeltierConfirmation();
 void readTemperature();
 void readPH();
 void handlePeltierControl();
 void checkScheduledFeeding();
 void performFeeding(const char *source);
-void publishFeedingConfirmation(const char *status);
+bool isTimePassedToday(int targetHour, int targetMin, const struct tm &now);
 void updateServoPosition();
 void startFeedingBlink();
 void updateFeedingBlink();
@@ -323,11 +290,157 @@ void checkButtons();
 void updateLCD();
 void displayNormalStatus();
 void setLCDNormalMode();
-void publishSensorData();
 
-// ============================================
-// SETUP
-// ============================================
+// =====SENSOR VALIDATION=====
+
+float validateTemperature(float temp)
+{
+  if (temp == TEMP_ERROR_VALUE || temp < TEMP_MIN_VALID || temp > TEMP_MAX_VALID)
+  {
+    Serial.printf("⚠️ [TEMP] Invalid: %.2f°C, using last valid: %.2f°C\n", temp, lastValidTemp);
+    return lastValidTemp;
+  }
+  lastValidTemp = temp;
+  return temp;
+}
+
+float validatePH(float ph)
+{
+  if (ph < PH_MIN_VALID || ph > PH_MAX_VALID || ph < 1.0)
+  {
+    Serial.printf("⚠️ [PH] Invalid: %.2f, using last valid: %.2f\n", ph, lastValidPH);
+    return lastValidPH;
+  }
+  lastValidPH = ph;
+  return ph;
+}
+
+// =====THINGSBOARD FUNCTIONS=====
+
+unsigned long getTimestampMillis()
+{
+  struct tm timeinfo;
+  if (!getLocalTime(&timeinfo))
+    return 0;
+  time_t now = mktime(&timeinfo);
+  return (unsigned long)now * 1000UL;
+}
+
+void publishTelemetryToThingsBoard(const char *key, float value)
+{
+  if (!TB_ENABLED || !mqttConnectedTB)
+    return;
+
+  StaticJsonDocument<128> doc;
+  doc[key] = value;
+  char jsonBuffer[128];
+  serializeJson(doc, jsonBuffer);
+
+  mqttClientTB.publish(TB_TELEMETRY_TOPIC, jsonBuffer);
+  Serial.printf("[TB] %s = %.2f\n", key, value);
+}
+
+void publishSensorTelemetryToThingsBoard()
+{
+  if (!TB_ENABLED || !mqttConnectedTB)
+    return;
+
+  StaticJsonDocument<256> doc;
+  doc["temperature"] = round(temperature * 10.0) / 10.0;
+  doc["pH"] = round(phValue * 100.0) / 100.0;
+
+  char jsonBuffer[256];
+  serializeJson(doc, jsonBuffer);
+
+  if (mqttClientTB.publish(TB_TELEMETRY_TOPIC, jsonBuffer))
+  {
+    Serial.printf("[TB] Telemetry: %s\n", jsonBuffer);
+  }
+}
+
+void publishFeedingEventToThingsBoard(const char *source)
+{
+  if (!TB_ENABLED || !mqttConnectedTB)
+    return;
+
+  StaticJsonDocument<64> doc;
+  doc["feed"] = 1;
+
+  char jsonBuffer[64];
+  serializeJson(doc, jsonBuffer);
+
+  if (mqttClientTB.publish(TB_TELEMETRY_TOPIC, jsonBuffer))
+  {
+    Serial.printf("[TB] Feed event sent: %s\n", source);
+  }
+}
+
+void publishAttributesToThingsBoard()
+{
+  if (!TB_ENABLED || !mqttConnectedTB)
+    return;
+
+  StaticJsonDocument<256> doc;
+  doc["targetTemp"] = targetTemp;
+  doc["peltierOn"] = peltierOn;
+  doc["feedingCountToday"] = feedingCountToday;
+  doc["firmware"] = "AquaSense_V2_Dual";
+
+  char jsonBuffer[256];
+  serializeJson(doc, jsonBuffer);
+
+  mqttClientTB.publish(TB_ATTRIBUTES_TOPIC, jsonBuffer);
+}
+
+// =====EMQX FUNCTIONS (for Flutter App)=====
+
+void publishSensorDataToEMQX()
+{
+  if (!EMQX_ENABLED || !mqttConnectedEMQX)
+    return;
+
+  char tempMsg[16];
+  char phMsg[16];
+
+  snprintf(tempMsg, sizeof(tempMsg), "%.1f", temperature);
+  snprintf(phMsg, sizeof(phMsg), "%.2f", phValue);
+
+  mqttClientEMQX.publish(TOPIC_TEMP, tempMsg);
+  mqttClientEMQX.publish(TOPIC_PH, phMsg);
+
+  Serial.printf("[EMQX] Temp=%.1f pH=%.2f\n", temperature, phValue);
+}
+
+void publishFeedingEventToEMQX(const char *status)
+{
+  if (!EMQX_ENABLED || !mqttConnectedEMQX)
+    return;
+
+  mqttClientEMQX.publish(TOPIC_EVENT_FEEDING, status);
+  mqttClientEMQX.publish(TOPIC_CMD_FEED_RES, status);
+  Serial.printf("[EMQX] Feed status: %s\n", status);
+}
+
+void publishTargetTempToEMQX()
+{
+  if (!EMQX_ENABLED || !mqttConnectedEMQX)
+    return;
+
+  char msg[16];
+  snprintf(msg, sizeof(msg), "%.1f", targetTemp);
+  mqttClientEMQX.publish(TOPIC_TEMP_TARGET, msg);
+  Serial.printf("[EMQX] Target temp: %.1f\n", targetTemp);
+}
+
+void publishPeltierStatusToEMQX()
+{
+  if (!EMQX_ENABLED || !mqttConnectedEMQX)
+    return;
+
+  mqttClientEMQX.publish(TOPIC_CMD_PELTIER_RES, peltierOn ? "ON" : "OFF");
+}
+
+// =====SETUP=====
 
 void setup()
 {
@@ -335,46 +448,44 @@ void setup()
   delay(100);
 
   Serial.println("\n========================================");
-  Serial.println("  AQUASENSE V2 - FIXED VERSION");
+  Serial.println("  AQUASENSE V2 - DUAL MQTT EDITION");
+  Serial.println("========================================");
+  Serial.println("  ThingsBoard + EMQX for Flutter App");
   Serial.println("========================================\n");
 
-  // Generate unique MQTT client ID
   uint64_t chipid = ESP.getEfuseMac();
-  snprintf(mqttClientId, sizeof(mqttClientId), "AquaSense-%04X%08X",
+  snprintf(mqttClientIdTB, sizeof(mqttClientIdTB), "AquaTB-%04X%08X",
            (uint16_t)(chipid >> 32), (uint32_t)chipid);
-  Serial.print("[MQTT] Client ID: ");
-  Serial.println(mqttClientId);
+  snprintf(mqttClientIdEMQX, sizeof(mqttClientIdEMQX), "AquaEMQX-%04X%08X",
+           (uint16_t)(chipid >> 32), (uint32_t)chipid);
+
+  Serial.printf("[MQTT] TB Client ID: %s\n", mqttClientIdTB);
+  Serial.printf("[MQTT] EMQX Client ID: %s\n", mqttClientIdEMQX);
 
   EEPROM.begin(64);
 
-  // GPIO Configuration
   pinMode(PIN_LED_INDICATOR, OUTPUT);
   pinMode(PIN_TEMP_UP_BTN, INPUT_PULLUP);
   pinMode(PIN_TEMP_DOWN_BTN, INPUT_PULLUP);
   pinMode(PIN_MANUAL_FEED_BTN, INPUT_PULLUP);
   digitalWrite(PIN_LED_INDICATOR, LOW);
 
-  // Initialize subsystems
   setupLCD();
   lcdMode = LCD_MODE_STARTUP;
   lcd.clear();
-  lcd.setCursor(3, 1);
+  lcd.setCursor(4, 1);
   lcd.print("AQUASENSE V2");
-  lcd.setCursor(4, 2);
-  lcd.print("Starting...");
+  lcd.setCursor(7, 2);
+  lcd.print("by R2J");
   delay(STARTUP_SCREEN_DELAY);
 
   setupSensors();
   setupActuators();
 
-  // Configure Peltier PWM
   ledcSetup(PELTIER_PWM_CHANNEL, PELTIER_PWM_FREQ, PELTIER_PWM_RESOLUTION);
   ledcAttachPin(PIN_PELTIER_PWM, PELTIER_PWM_CHANNEL);
   ledcWrite(PELTIER_PWM_CHANNEL, 0);
-  Serial.print("[PELTIER] Configured on LEDC Channel ");
-  Serial.println(PELTIER_PWM_CHANNEL);
 
-  // Quick WiFi attempt
   setupWiFi();
 
   if (wifiConnected)
@@ -383,43 +494,42 @@ void setup()
     lastNtpSync = 0;
   }
 
-  // Fast peltier startup
   smartPeltierStartup();
 
-  // Startup complete
   lcd.clear();
   lcd.setCursor(4, 1);
-  lcd.print("System Ready!");
-  lcd.setCursor(0, 2);
-  lcd.print("Heap:");
+  lcd.print("System Ready");
+  lcd.setCursor(3, 2);
+  lcd.print("Free Heap: ");
   lcd.print(ESP.getFreeHeap() / 1024);
   lcd.print("KB");
   delay(READY_SCREEN_DELAY);
   setLCDNormalMode();
+
+  Serial.println("\n[SYSTEM] Initialization complete!");
+  Serial.printf("[MEMORY] Free heap: %d bytes\n", ESP.getFreeHeap());
 }
 
-// ============================================
-// MAIN LOOP
-// ============================================
+// =====MAIN LOOP======
 
 void loop()
 {
   unsigned long currentMillis = millis();
 
-  // WiFi management
   reconnectWiFi();
+  checkMQTTConnectionTB();
+  checkMQTTConnectionEMQX();
 
-  // MQTT management
-  checkMQTTConnection();
-
-  // Always call mqttClient.loop()
-  if (mqttClient.connected())
+  if (mqttClientTB.connected())
   {
-    mqttClient.loop();
+    mqttClientTB.loop();
+  }
+  if (mqttClientEMQX.connected())
+  {
+    mqttClientEMQX.loop();
     processDeferredActions();
   }
 
-  // Background NTP sync
   if (wifiConnected && !timesynced)
   {
     if (lastNtpSync == 0 || currentMillis - lastNtpSync >= 5000)
@@ -437,7 +547,6 @@ void loop()
     }
   }
 
-  // Sensor readings with validation
   if (currentMillis - lastTempRead >= 2000)
   {
     readTemperature();
@@ -450,10 +559,8 @@ void loop()
     lastPhRead = currentMillis;
   }
 
-  // Temperature control
   handlePeltierControl();
 
-  // Feeding management
   if (timesynced && !feedingInProgress)
   {
     checkScheduledFeeding();
@@ -463,57 +570,48 @@ void loop()
   updateServoPosition();
   checkButtons();
 
-  // Display update
   if (currentMillis - lastLcdUpdate >= 1000)
   {
     updateLCD();
     lastLcdUpdate = currentMillis;
   }
 
-  // MQTT publishing
-  if (mqttConnected && (currentMillis - lastMqttPublish >= 10000))
+  if (TB_ENABLED && mqttConnectedTB && (currentMillis - lastMqttPublishTB >= TB_PUBLISH_INTERVAL))
   {
-    publishSensorData();
-    lastMqttPublish = currentMillis;
+    publishSensorTelemetryToThingsBoard();
+    publishAttributesToThingsBoard();
+    lastMqttPublishTB = currentMillis;
+  }
+
+  if (EMQX_ENABLED && mqttConnectedEMQX && (currentMillis - lastMqttPublishEMQX >= EMQX_PUBLISH_INTERVAL))
+  {
+    publishSensorDataToEMQX();
+    lastMqttPublishEMQX = currentMillis;
   }
 }
 
-// ============================================
-// SETUP FUNCTIONS
-// ============================================
+// =====SETUP FUNCTIONS=====
 
 void setupLCD()
 {
   Wire.begin(PIN_LCD_SDA, PIN_LCD_SCL);
   lcd.init();
   lcd.backlight();
-
-  // Initialize LCD buffers
   for (int i = 0; i < 4; i++)
   {
     memset(lcdBuffer[i], 0, sizeof(lcdBuffer[i]));
   }
-
   Serial.println("[LCD] Initialized");
 }
 
 void setupSensors()
 {
   tempSensor.begin();
-  int deviceCount = tempSensor.getDeviceCount();
-  Serial.printf("[DS18B20] Found %d device(s)\n", deviceCount);
-
-  if (deviceCount == 0)
-  {
-    Serial.println("[DS18B20] ⚠️ WARNING: No sensor detected!");
-    Serial.println("[DS18B20] Check: 4.7kΩ pull-up resistor, power, wiring");
-  }
-
   tempSensor.setResolution(12);
   phSensor.begin();
   analogReadResolution(12);
   analogSetAttenuation(ADC_11db);
-  Serial.println("[Sensors] Initialized (DS18B20 + pH)");
+  Serial.println("[Sensors] Initialized");
 }
 
 void setupActuators()
@@ -527,15 +625,12 @@ void setupActuators()
   feedServo.attach(PIN_SERVO, 500, 2400);
   feedServo.write(SERVO_REST_ANGLE);
   delay(300);
-
-  Serial.println("[Servo] Initialized on GPIO8");
-  Serial.printf("[Servo] Feed angle: %d°, Duration: %dms\n",
-                SERVO_FEED_ANGLE, SERVO_FEED_DURATION);
+  Serial.println("[Servo] Initialized");
 }
 
 void setupWiFi()
 {
-  Serial.print("[WiFi] Quick connect to ");
+  Serial.print("[WiFi] Connecting to ");
   Serial.println(WIFI_SSID);
 
   WiFi.mode(WIFI_STA);
@@ -555,37 +650,59 @@ void setupWiFi()
   if (wifiConnected)
   {
     wifiState = WIFI_STATE_CONNECTED;
-    Serial.println("\n[WiFi] Connected!");
+    Serial.println("\n[WiFi] ✅ Connected!");
     Serial.print("[WiFi] IP: ");
     Serial.println(WiFi.localIP());
   }
   else
   {
     wifiState = WIFI_STATE_DISCONNECTED;
-    Serial.println("\n[WiFi] Not connected, will retry in background");
+    Serial.println("\n[WiFi] Not connected, will retry");
     lastWifiAttempt = millis();
   }
 }
 
 void setupMQTT()
 {
-  mqttClient.setServer(MQTT_BROKER, MQTT_PORT);
-  mqttClient.setCallback(mqttCallback);
-  mqttClient.setBufferSize(512);
-  mqttClient.setKeepAlive(15);
+  Serial.println("\n========================================");
+  Serial.println("  DUAL MQTT BROKER CONFIGURATION");
+  Serial.println("========================================");
 
-  Serial.println("[MQTT] Configured with 15s keepalive");
-
-  if (wifiConnected)
+  if (TB_ENABLED)
   {
-    mqttState = MQTT_STATE_DISCONNECTED;
+    Serial.println("[TB] Configuring ThingsBoard...");
+    Serial.printf("  Server: %s:%d\n", TB_SERVER, TB_PORT);
+    Serial.printf("  Token: %s\n", strlen(TB_TOKEN) > 10 ? "***CONFIGURED***" : "❌ NOT SET");
+    mqttClientTB.setServer(TB_SERVER, TB_PORT);
+    mqttClientTB.setCallback(mqttCallbackTB);
+    mqttClientTB.setBufferSize(1024);
+    mqttClientTB.setKeepAlive(15);
   }
+  else
+  {
+    Serial.println("[TB] ⚠️ ThingsBoard DISABLED");
+  }
+
+  if (EMQX_ENABLED)
+  {
+    Serial.println("[EMQX] Configuring EMQX for Flutter App...");
+    Serial.printf("  Server: %s:%d\n", EMQX_SERVER, EMQX_PORT);
+    mqttClientEMQX.setServer(EMQX_SERVER, EMQX_PORT);
+    mqttClientEMQX.setCallback(mqttCallbackEMQX);
+    mqttClientEMQX.setBufferSize(512);
+    mqttClientEMQX.setKeepAlive(15);
+  }
+  else
+  {
+    Serial.println("[EMQX] ⚠️ EMQX DISABLED");
+  }
+
+  Serial.println("========================================\n");
 }
 
 void syncTimeWithNTPBackground()
 {
   static bool syncInProgress = false;
-
   if (syncInProgress)
     return;
 
@@ -596,13 +713,8 @@ void syncTimeWithNTPBackground()
   if (getLocalTime(&timeinfo))
   {
     timesynced = true;
-    Serial.println("[NTP] Background sync complete!");
-    Serial.printf("[NTP] Current time: %02d:%02d:%02d\n",
+    Serial.printf("[NTP] ✅ Synced: %02d:%02d:%02d\n",
                   timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec);
-  }
-  else
-  {
-    Serial.println("[NTP] Sync attempt (will retry)");
   }
 
   syncInProgress = false;
@@ -610,8 +722,6 @@ void syncTimeWithNTPBackground()
 
 void smartPeltierStartup()
 {
-  Serial.println("[Peltier] Quick initialization...");
-
   tempSensor.requestTemperatures();
   float rawTemp = tempSensor.getTempCByIndex(0);
   temperature = validateTemperature(rawTemp);
@@ -621,15 +731,10 @@ void smartPeltierStartup()
   lastPeltierChange = millis();
   peltierInitialized = true;
 
-  Serial.print("[Peltier] Initialized - State: ");
-  Serial.println(peltierOn ? "ON (Cooling)" : "OFF");
-  Serial.printf("[Peltier] Current: %.2f°C, Target: %.1f°C\n",
-                temperature, targetTemp);
+  Serial.printf("[Peltier] Init: %s (%.2f°C)\n", peltierOn ? "ON" : "OFF", temperature);
 }
 
-// ============================================
-// WIFI RECONNECTION
-// ============================================
+// =====WIFI RECONNECTION=====
 
 void reconnectWiFi()
 {
@@ -642,19 +747,21 @@ void reconnectWiFi()
     if (status != WL_CONNECTED)
     {
       wifiConnected = false;
-      mqttConnected = false;
+      mqttConnectedTB = false;
+      mqttConnectedEMQX = false;
       digitalWrite(PIN_LED_INDICATOR, LOW);
       Serial.println("[WiFi] ❌ Connection lost!");
       wifiState = WIFI_STATE_DISCONNECTED;
       lastWifiAttempt = currentMillis;
-      mqttState = MQTT_STATE_DISCONNECTED;
+      mqttStateTB = MQTT_STATE_DISCONNECTED;
+      mqttStateEMQX = MQTT_STATE_DISCONNECTED;
     }
     break;
 
   case WIFI_STATE_DISCONNECTED:
     if (currentMillis - lastWifiAttempt >= 30000)
     {
-      Serial.println("[WiFi] Starting reconnection attempt...");
+      Serial.println("[WiFi] Reconnecting...");
       WiFi.disconnect();
       delay(100);
       WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
@@ -672,16 +779,14 @@ void reconnectWiFi()
       Serial.print("[WiFi] IP: ");
       Serial.println(WiFi.localIP());
       wifiState = WIFI_STATE_CONNECTED;
-      mqttState = MQTT_STATE_DISCONNECTED;
-
+      mqttStateTB = MQTT_STATE_DISCONNECTED;
+      mqttStateEMQX = MQTT_STATE_DISCONNECTED;
       if (!timesynced)
-      {
         lastNtpSync = 0;
-      }
     }
     else if (currentMillis - wifiReconnectStartTime > 10000)
     {
-      Serial.println("[WiFi] ❌ Reconnection failed, will retry in 30s");
+      Serial.println("[WiFi] ❌ Reconnection failed");
       wifiState = WIFI_STATE_DISCONNECTED;
       lastWifiAttempt = currentMillis;
     }
@@ -689,9 +794,7 @@ void reconnectWiFi()
   }
 }
 
-// ============================================
-// MQTT RECONNECTION
-// ============================================
+// =====MQTT MANAGEMENT - THINGSBOARD=====
 
 const char *getMQTTStateDescription(int state)
 {
@@ -722,128 +825,200 @@ const char *getMQTTStateDescription(int state)
   }
 }
 
-void reconnectMQTT()
+void reconnectMQTTTB()
 {
-  if (!wifiConnected)
-  {
-    mqttState = MQTT_STATE_DISCONNECTED;
-    mqttConnected = false;
+  if (!TB_ENABLED || !wifiConnected)
     return;
-  }
 
-  Serial.printf("[MQTT] Connection attempt %d/%d...",
-                mqttRetryCount + 1, MQTT_MAX_RETRY_COUNT);
+  Serial.printf("[TB] Attempt %d/%d...", mqttRetryCountTB + 1, MQTT_MAX_RETRY_COUNT);
 
-  bool connected = (strlen(MQTT_USER) > 0)
-                       ? mqttClient.connect(mqttClientId, MQTT_USER, MQTT_PASSWORD)
-                       : mqttClient.connect(mqttClientId);
+  bool connected = mqttClientTB.connect(mqttClientIdTB, TB_TOKEN, NULL);
 
   if (connected)
   {
-    mqttConnected = true;
-    mqttState = MQTT_STATE_CONNECTED;
-    mqttRetryCount = 0;
+    mqttConnectedTB = true;
+    mqttStateTB = MQTT_STATE_CONNECTED;
+    mqttRetryCountTB = 0;
+    Serial.println("Connected!");
 
-    Serial.println(" ✅ Connected!");
-
-    mqttClient.subscribe(TOPIC_CMD_FEED_REQ);
-    mqttClient.subscribe(TOPIC_CMD_PELTIER_REQ);
-    mqttClient.subscribe(TOPIC_CMD_TEMP_ADJUST_REQ);
-    mqttClient.subscribe(TOPIC_CMD_SETTEMP_REQ);
-
-    mqttClient.publish(TOPIC_STATUS, "{\"status\":\"online\"}");
-    publishTargetTemp();
-
-    Serial.println("[MQTT] All subscriptions renewed");
+    mqttClientTB.subscribe(TB_RPC_SUBSCRIBE_TOPIC);
+    publishAttributesToThingsBoard();
+    publishSensorTelemetryToThingsBoard();
   }
   else
   {
-    mqttConnected = false;
-    mqttRetryCount++;
+    mqttConnectedTB = false;
+    mqttRetryCountTB++;
+    Serial.printf(" Failed: %s\n", getMQTTStateDescription(mqttClientTB.state()));
 
-    Serial.printf(" ❌ Failed: %s (rc=%d)\n",
-                  getMQTTStateDescription(mqttClient.state()),
-                  mqttClient.state());
-
-    if (mqttRetryCount >= MQTT_MAX_RETRY_COUNT)
+    if (mqttRetryCountTB >= MQTT_MAX_RETRY_COUNT)
     {
-      Serial.println("[MQTT] Max retries reached, resetting counter");
-      mqttRetryCount = 0;
-    }
-    else
-    {
-      unsigned long nextRetry = getMQTTRetryInterval(mqttRetryCount - 1);
-      Serial.printf("[MQTT] Will retry in %lu seconds\n", nextRetry / 1000);
+      mqttRetryCountTB = 0;
     }
   }
 }
 
-void checkMQTTConnection()
+void checkMQTTConnectionTB()
 {
+  if (!TB_ENABLED)
+    return;
+
   unsigned long currentMillis = millis();
 
-  switch (mqttState)
+  switch (mqttStateTB)
   {
   case MQTT_STATE_CONNECTED:
-    if (!mqttClient.connected())
+    if (!mqttClientTB.connected())
     {
-      mqttConnected = false;
-      mqttState = MQTT_STATE_DISCONNECTED;
-      mqttLastRetryTime = currentMillis;
-      mqttRetryCount = 0;
-
-      Serial.println("\n[MQTT] ❌ Connection lost!");
-      Serial.println("[MQTT] Will attempt reconnection...");
+      mqttConnectedTB = false;
+      mqttStateTB = MQTT_STATE_DISCONNECTED;
+      mqttLastRetryTimeTB = currentMillis;
+      mqttRetryCountTB = 0;
+      Serial.println("[TB] Connection lost!");
     }
     break;
 
   case MQTT_STATE_DISCONNECTED:
     if (!wifiConnected)
       break;
-
-    Serial.println("[MQTT] Starting reconnection...");
-    mqttState = MQTT_STATE_CONNECTING;
-    mqttReconnectStartTime = currentMillis;
-    reconnectMQTT();
+    mqttStateTB = MQTT_STATE_CONNECTING;
+    mqttReconnectStartTimeTB = currentMillis;
+    reconnectMQTTTB();
     break;
 
   case MQTT_STATE_CONNECTING:
-    if (mqttConnected)
+    if (mqttConnectedTB)
     {
-      mqttState = MQTT_STATE_CONNECTED;
+      mqttStateTB = MQTT_STATE_CONNECTED;
     }
-    else if (currentMillis - mqttReconnectStartTime > MQTT_CONNECT_TIMEOUT)
+    else if (currentMillis - mqttReconnectStartTimeTB > MQTT_CONNECT_TIMEOUT)
     {
-      mqttState = MQTT_STATE_WAITING_RETRY;
-      mqttLastRetryTime = currentMillis;
-      Serial.println("[MQTT] Connection attempt timed out");
+      mqttStateTB = MQTT_STATE_WAITING_RETRY;
+      mqttLastRetryTimeTB = currentMillis;
     }
     break;
 
   case MQTT_STATE_WAITING_RETRY:
     if (!wifiConnected)
     {
-      mqttState = MQTT_STATE_DISCONNECTED;
+      mqttStateTB = MQTT_STATE_DISCONNECTED;
       break;
     }
 
-    unsigned long retryDelay = getMQTTRetryInterval(mqttRetryCount);
+    unsigned long retryDelay = (mqttRetryCountTB == 0) ? 5000 : 30000;
 
-    if (currentMillis - mqttLastRetryTime >= retryDelay)
+    if (currentMillis - mqttLastRetryTimeTB >= retryDelay)
     {
-      mqttState = MQTT_STATE_CONNECTING;
-      mqttReconnectStartTime = currentMillis;
-      reconnectMQTT();
+      mqttStateTB = MQTT_STATE_CONNECTING;
+      mqttReconnectStartTimeTB = currentMillis;
+      reconnectMQTTTB();
     }
     break;
   }
 }
 
-// ============================================
-// MQTT CALLBACK
-// ============================================
+// =====MQTT MANAGEMENT - EMQX=====
 
-void mqttCallback(char *topic, byte *payload, unsigned int length)
+void reconnectMQTTEMQX()
+{
+  if (!EMQX_ENABLED || !wifiConnected)
+    return;
+
+  Serial.printf("[EMQX] Attempt %d/%d...", mqttRetryCountEMQX + 1, MQTT_MAX_RETRY_COUNT);
+
+  bool connected = mqttClientEMQX.connect(mqttClientIdEMQX, EMQX_USER, EMQX_PASSWORD);
+
+  if (connected)
+  {
+    mqttConnectedEMQX = true;
+    mqttStateEMQX = MQTT_STATE_CONNECTED;
+    mqttRetryCountEMQX = 0;
+    Serial.println("Connected!");
+
+    mqttClientEMQX.subscribe(TOPIC_CMD_FEED_REQ);
+    mqttClientEMQX.subscribe(TOPIC_CMD_TEMP_ADJUST_REQ);
+    mqttClientEMQX.subscribe(TOPIC_CMD_SETTEMP_REQ);
+    mqttClientEMQX.subscribe(TOPIC_CMD_PELTIER_REQ);
+
+    publishSensorDataToEMQX();
+    publishTargetTempToEMQX();
+    publishPeltierStatusToEMQX();
+  }
+  else
+  {
+    mqttConnectedEMQX = false;
+    mqttRetryCountEMQX++;
+    Serial.printf("Failed: %s\n", getMQTTStateDescription(mqttClientEMQX.state()));
+
+    if (mqttRetryCountEMQX >= MQTT_MAX_RETRY_COUNT)
+    {
+      mqttRetryCountEMQX = 0;
+    }
+  }
+}
+
+void checkMQTTConnectionEMQX()
+{
+  if (!EMQX_ENABLED)
+    return;
+
+  unsigned long currentMillis = millis();
+
+  switch (mqttStateEMQX)
+  {
+  case MQTT_STATE_CONNECTED:
+    if (!mqttClientEMQX.connected())
+    {
+      mqttConnectedEMQX = false;
+      mqttStateEMQX = MQTT_STATE_DISCONNECTED;
+      mqttLastRetryTimeEMQX = currentMillis;
+      mqttRetryCountEMQX = 0;
+      Serial.println("[EMQX] Connection lost!");
+    }
+    break;
+
+  case MQTT_STATE_DISCONNECTED:
+    if (!wifiConnected)
+      break;
+    mqttStateEMQX = MQTT_STATE_CONNECTING;
+    mqttReconnectStartTimeEMQX = currentMillis;
+    reconnectMQTTEMQX();
+    break;
+
+  case MQTT_STATE_CONNECTING:
+    if (mqttConnectedEMQX)
+    {
+      mqttStateEMQX = MQTT_STATE_CONNECTED;
+    }
+    else if (currentMillis - mqttReconnectStartTimeEMQX > MQTT_CONNECT_TIMEOUT)
+    {
+      mqttStateEMQX = MQTT_STATE_WAITING_RETRY;
+      mqttLastRetryTimeEMQX = currentMillis;
+    }
+    break;
+
+  case MQTT_STATE_WAITING_RETRY:
+    if (!wifiConnected)
+    {
+      mqttStateEMQX = MQTT_STATE_DISCONNECTED;
+      break;
+    }
+
+    unsigned long retryDelay = (mqttRetryCountEMQX == 0) ? 5000 : 30000;
+
+    if (currentMillis - mqttLastRetryTimeEMQX >= retryDelay)
+    {
+      mqttStateEMQX = MQTT_STATE_CONNECTING;
+      mqttReconnectStartTimeEMQX = currentMillis;
+      reconnectMQTTEMQX();
+    }
+    break;
+  }
+}
+
+// =====MQTT CALLBACKS=====
+
+void mqttCallbackTB(char *topic, byte *payload, unsigned int length)
 {
   char message[256];
   if (length >= sizeof(message))
@@ -851,19 +1026,50 @@ void mqttCallback(char *topic, byte *payload, unsigned int length)
   memcpy(message, payload, length);
   message[length] = '\0';
 
-  Serial.printf("\n[MQTT] %s: %s\n", topic, message);
+  Serial.printf("[TB] RPC: %s\n", message);
+
+  if (strstr(topic, "rpc/request"))
+  {
+    StaticJsonDocument<256> doc;
+    if (deserializeJson(doc, message) == DeserializationError::Ok)
+    {
+      const char *method = doc["method"];
+
+      if (strcmp(method, "feedNow") == 0)
+      {
+        pendingFeedAction = true;
+      }
+      else if (strcmp(method, "setTargetTemp") == 0)
+      {
+        float temp = doc["params"]["value"];
+        if (isValidTargetTemp(temp))
+        {
+          pendingTempSet = true;
+          pendingTempValue = temp;
+        }
+      }
+    }
+  }
+}
+
+void mqttCallbackEMQX(char *topic, byte *payload, unsigned int length)
+{
+  char message[256];
+  if (length >= sizeof(message))
+    length = sizeof(message) - 1;
+  memcpy(message, payload, length);
+  message[length] = '\0';
+
+  Serial.printf("[EMQX] %s: %s\n", topic, message);
 
   if (strcmp(topic, TOPIC_CMD_FEED_REQ) == 0)
   {
     if (strcasecmp(message, "NOW") == 0)
     {
-      Serial.println("[MQTT] Feed command received");
       pendingFeedAction = true;
     }
-    return;
   }
-
-  if (strcmp(topic, TOPIC_CMD_TEMP_ADJUST_REQ) == 0)
+  else if (strcmp(topic, TOPIC_CMD_TEMP_ADJUST_REQ) == 0)
   {
     if (strcasecmp(message, "up") == 0)
     {
@@ -873,10 +1079,8 @@ void mqttCallback(char *topic, byte *payload, unsigned int length)
     {
       pendingTempAdjustDown = true;
     }
-    return;
   }
-
-  if (strcmp(topic, TOPIC_CMD_SETTEMP_REQ) == 0)
+  else if (strcmp(topic, TOPIC_CMD_SETTEMP_REQ) == 0)
   {
     float newTemp = atof(message);
     if (isValidTargetTemp(newTemp))
@@ -884,49 +1088,29 @@ void mqttCallback(char *topic, byte *payload, unsigned int length)
       pendingTempSet = true;
       pendingTempValue = newTemp;
     }
-    return;
   }
 }
 
-// ============================================
-// DEFERRED ACTIONS
-// ============================================
+// =====DEFERRED ACTIONS=====
 
 void processDeferredActions()
 {
   if (pendingFeedAction)
   {
-    Serial.println("[ACTION] Processing feed action...");
     pendingFeedAction = false;
-    performFeeding("MQTT App");
+    performFeeding("MQTT Command");
   }
 
   if (pendingTempAdjustUp)
   {
     pendingTempAdjustUp = false;
     adjustTargetTemp(1);
-    if (mqttConnected)
-    {
-      char response[128];
-      snprintf(response, sizeof(response),
-               "{\"status\":\"success\",\"targetTemp\":%.1f,\"currentTemp\":%.2f}",
-               targetTemp, temperature);
-      mqttClient.publish(TOPIC_CMD_TEMP_ADJUST_RES, response);
-    }
   }
 
   if (pendingTempAdjustDown)
   {
     pendingTempAdjustDown = false;
     adjustTargetTemp(-1);
-    if (mqttConnected)
-    {
-      char response[128];
-      snprintf(response, sizeof(response),
-               "{\"status\":\"success\",\"targetTemp\":%.1f,\"currentTemp\":%.2f}",
-               targetTemp, temperature);
-      mqttClient.publish(TOPIC_CMD_TEMP_ADJUST_RES, response);
-    }
   }
 
   if (pendingTempSet)
@@ -935,21 +1119,11 @@ void processDeferredActions()
     if (isValidTargetTemp(pendingTempValue))
     {
       setTargetTemp(pendingTempValue);
-      if (mqttConnected)
-      {
-        char response[128];
-        snprintf(response, sizeof(response),
-                 "{\"status\":\"success\",\"targetTemp\":%.1f,\"currentTemp\":%.2f}",
-                 targetTemp, temperature);
-        mqttClient.publish(TOPIC_CMD_SETTEMP_RES, response);
-      }
     }
   }
 }
 
-// ============================================
-// TEMPERATURE CONTROL
-// ============================================
+// =====TEMPERATURE CONTROL=====
 
 void adjustTargetTemp(int direction)
 {
@@ -963,28 +1137,16 @@ void adjustTargetTemp(int direction)
 void setTargetTemp(float newTemp)
 {
   targetTemp = round(newTemp * 10.0) / 10.0;
-  Serial.printf("[TEMP] Target set to: %.1f°C\n", targetTemp);
-  publishTargetTemp();
+  Serial.printf("[TEMP] Target: %.1f°C\n", targetTemp);
+
+  publishTargetTempToEMQX();
+  publishAttributesToThingsBoard();
 }
 
 bool isValidTargetTemp(float temp)
 {
   return (temp >= TEMP_TARGET_MIN && temp <= TEMP_TARGET_MAX);
 }
-
-void publishTargetTemp()
-{
-  if (mqttConnected)
-  {
-    char tempStr[TEMP_STR_SIZE];
-    snprintf(tempStr, sizeof(tempStr), "%.1f", targetTemp);
-    mqttClient.publish(TOPIC_TEMP_TARGET, tempStr, true);
-  }
-}
-
-// ============================================
-// PELTIER CONTROL
-// ============================================
 
 void setPeltierState(bool state)
 {
@@ -997,32 +1159,18 @@ void setPeltierState(bool state)
   lastPeltierChange = millis();
   ledcWrite(PELTIER_PWM_CHANNEL, peltierOn ? PELTIER_ON_PWM : PELTIER_OFF_PWM);
 
-  Serial.printf("[PELTIER] State changed: %s\n", peltierOn ? "ON" : "OFF");
+  Serial.printf("[PELTIER] %s\n", peltierOn ? "ON" : "OFF");
+
+  publishPeltierStatusToEMQX();
+  publishAttributesToThingsBoard();
 }
 
-void publishPeltierConfirmation()
-{
-  if (mqttConnected)
-  {
-    char response[128];
-    snprintf(response, sizeof(response),
-             "{\"peltierOn\":%s,\"currentTemp\":%.2f,\"targetTemp\":%.1f,\"pwm\":%d}",
-             peltierOn ? "true" : "false", temperature, targetTemp,
-             peltierOn ? PELTIER_ON_PWM : PELTIER_OFF_PWM);
-    mqttClient.publish(TOPIC_CMD_PELTIER_RES, response);
-  }
-}
-
-// ============================================
-// SENSORS (WITH VALIDATION)
-// ============================================
+// =====SENSORS=====
 
 void readTemperature()
 {
   tempSensor.requestTemperatures();
   float rawTemp = tempSensor.getTempCByIndex(0);
-
-  // Validate and store
   temperature = validateTemperature(rawTemp);
 }
 
@@ -1030,24 +1178,15 @@ void readPH()
 {
   voltage = analogReadMilliVolts(PIN_PH_SENSOR);
   float rawPH = phSensor.readPH(voltage, temperature);
-
-  // Validate and store
   phValue = validatePH(rawPH);
 }
-
-// ============================================
-// TEMPERATURE CONTROL
-// ============================================
 
 void handlePeltierControl()
 {
   if (!peltierInitialized)
     return;
   if (millis() - lastPeltierChange < PELTIER_MIN_CYCLE_TIME)
-  {
-    ledcWrite(PELTIER_PWM_CHANNEL, peltierOn ? PELTIER_ON_PWM : PELTIER_OFF_PWM);
     return;
-  }
 
   bool shouldBeOn = peltierOn
                         ? (temperature > targetTemp)
@@ -1055,18 +1194,22 @@ void handlePeltierControl()
 
   if (shouldBeOn != peltierOn)
   {
-    peltierOn = shouldBeOn;
-    lastPeltierChange = millis();
-    ledcWrite(PELTIER_PWM_CHANNEL, peltierOn ? PELTIER_ON_PWM : PELTIER_OFF_PWM);
-
-    Serial.printf("[PELTIER] Auto control: %s (Temp: %.2f°C, Target: %.1f°C)\n",
-                  peltierOn ? "ON" : "OFF", temperature, targetTemp);
+    setPeltierState(shouldBeOn);
   }
 }
 
-// ============================================
-// FEEDING
-// ============================================
+// =====FEEDING=====
+
+bool isTimePassedToday(int targetHour, int targetMin, const struct tm &now)
+{
+  if (now.tm_hour > targetHour)
+    return true;
+
+  if (now.tm_hour == targetHour && now.tm_min >= targetMin)
+    return true;
+
+  return false;
+}
 
 void checkScheduledFeeding()
 {
@@ -1077,38 +1220,39 @@ void checkScheduledFeeding()
   int h = timeinfo.tm_hour;
   int m = timeinfo.tm_min;
 
-  if (!fed1Today && h == FEED_TIME_1_HOUR && m == FEED_TIME_1_MIN)
+  if (!fed1Today && isTimePassedToday(FEED_TIME_1_HOUR, FEED_TIME_1_MIN, timeinfo))
   {
     performFeeding("Schedule 08:00");
     fed1Today = true;
   }
 
-  if (!fed2Today && h == FEED_TIME_2_HOUR && m == FEED_TIME_2_MIN)
+  if (!fed2Today && isTimePassedToday(FEED_TIME_2_HOUR, FEED_TIME_2_MIN, timeinfo))
   {
     performFeeding("Schedule 20:00");
     fed2Today = true;
   }
 
-  if (h == 0 && m == 0)
+  if (h == 0 && m == 0 && !resetDoneToday)
   {
     resetDailyFeedingCount();
+    resetDoneToday = true;
+  }
+
+  if (h != 0 || m != 0)
+  {
+    resetDoneToday = false;
   }
 }
 
 void performFeeding(const char *source)
 {
-  Serial.println("\n========================================");
-  Serial.println("🐟 FEEDING SEQUENCE START");
-  Serial.println("========================================");
-
   if (feedingInProgress)
   {
-    Serial.println("[FEED] Already in progress - ignoring");
-    publishFeedingConfirmation("busy");
+    publishFeedingEventToEMQX("busy");
     return;
   }
 
-  Serial.printf("[FEED] Triggered by: %s\n", source);
+  Serial.printf("\n[FEED] 🐟 Feeding: %s\n", source);
 
   feedingInProgress = true;
   servoMoving = true;
@@ -1118,16 +1262,15 @@ void performFeeding(const char *source)
 
   if (!servoAttached)
   {
-    Serial.println("[SERVO] Re-attaching servo...");
     feedServo.attach(PIN_SERVO, 500, 2400);
     servoAttached = true;
     delay(100);
   }
 
-  Serial.printf("[SERVO] Moving to feed position (%d°)...\n", SERVO_FEED_ANGLE);
   feedServo.write(SERVO_FEED_ANGLE);
 
-  Serial.println("========================================\n");
+  publishFeedingEventToThingsBoard(source);
+  publishFeedingEventToEMQX("started");
 }
 
 void updateServoPosition()
@@ -1137,12 +1280,6 @@ void updateServoPosition()
 
   if (millis() - servoMoveStartTime >= SERVO_FEED_DURATION)
   {
-    Serial.println("\n========================================");
-    Serial.println("🐟 FEEDING SEQUENCE COMPLETE");
-    Serial.println("========================================");
-
-    Serial.printf("[SERVO] Returning to rest (%d°)...\n", SERVO_REST_ANGLE);
-
     feedServo.write(SERVO_REST_ANGLE);
     delay(500);
 
@@ -1150,23 +1287,10 @@ void updateServoPosition()
     feedingInProgress = false;
     servoDetachTime = millis();
 
-    Serial.println("[SERVO] Returned to rest position");
-    Serial.printf("[FEED] Complete! Today's count: %d\n", feedingCountToday);
-    Serial.println("========================================\n");
+    Serial.printf("[FEED] Complete! Count today: %d\n", feedingCountToday);
 
-    publishFeedingConfirmation("completed");
-  }
-}
-
-void publishFeedingConfirmation(const char *status)
-{
-  if (mqttConnected)
-  {
-    char response[128];
-    snprintf(response, sizeof(response),
-             "{\"action\":\"feeding\",\"status\":\"%s\",\"count\":%d}",
-             status, feedingCountToday);
-    mqttClient.publish(TOPIC_CMD_FEED_RES, response);
+    publishFeedingEventToEMQX("completed");
+    publishAttributesToThingsBoard();
   }
 }
 
@@ -1202,12 +1326,11 @@ void resetDailyFeedingCount()
   feedingCountToday = 0;
   fed1Today = false;
   fed2Today = false;
-  Serial.println("[FEED] Daily counter reset");
+  Serial.println("[FEED] Daily reset");
+  publishAttributesToThingsBoard();
 }
 
-// ============================================
-// BUTTONS
-// ============================================
+// =====BUTTONS=====
 
 void checkButtons()
 {
@@ -1219,7 +1342,6 @@ void checkButtons()
     tempUpPressed = true;
     lastDebounceTime = millis();
     adjustTargetTemp(1);
-    Serial.println("[BTN] Temp UP pressed");
   }
   else if (digitalRead(PIN_TEMP_UP_BTN) == HIGH)
   {
@@ -1231,7 +1353,6 @@ void checkButtons()
     tempDownPressed = true;
     lastDebounceTime = millis();
     adjustTargetTemp(-1);
-    Serial.println("[BTN] Temp DOWN pressed");
   }
   else if (digitalRead(PIN_TEMP_DOWN_BTN) == HIGH)
   {
@@ -1242,7 +1363,6 @@ void checkButtons()
   {
     manualFeedPressed = true;
     lastDebounceTime = millis();
-    Serial.println("[BTN] Manual FEED pressed");
     performFeeding("Manual Button");
   }
   else if (digitalRead(PIN_MANUAL_FEED_BTN) == HIGH)
@@ -1251,9 +1371,7 @@ void checkButtons()
   }
 }
 
-// ============================================
-// LCD DISPLAY (FIXED WITH SAFE BUFFERS)
-// ============================================
+// =====LCD DISPLAY=====
 
 void updateLCD()
 {
@@ -1264,24 +1382,18 @@ void updateLCD()
 
 void displayNormalStatus()
 {
-  // Use static buffers to keep them off the stack
   static char line[LCD_BUFFER_SIZE];
-  static char tempStr[TEMP_STR_SIZE];
-  static char phStr[TEMP_STR_SIZE];
-  static char targetStr[TEMP_STR_SIZE];
+  char tempStr[TEMP_STR_SIZE];
+  char phStr[TEMP_STR_SIZE];
+  char targetStr[TEMP_STR_SIZE];
 
-  // Clear line buffer
-  memset(line, 0, LCD_BUFFER_SIZE);
-
-  // Safe float to string conversion
-  safeFloatToStr(tempStr, sizeof(tempStr), temperature, 4, 1);
-  safeFloatToStr(phStr, sizeof(phStr), phValue, 4, 2);
-  safeFloatToStr(targetStr, sizeof(targetStr), targetTemp, 4, 1);
+  snprintf(tempStr, sizeof(tempStr), "%.1f", temperature);
+  snprintf(phStr, sizeof(phStr), "%.2f", phValue);
+  snprintf(targetStr, sizeof(targetStr), "%.1f", targetTemp);
 
   struct tm timeinfo;
   bool hasTime = timesynced && getLocalTime(&timeinfo);
 
-  // Line 0: Temperature and Time (SAFE)
   if (hasTime)
   {
     snprintf(line, LCD_BUFFER_SIZE, "Temp:%sC    %02d:%02d",
@@ -1297,45 +1409,45 @@ void displayNormalStatus()
     lcd.setCursor(0, 0);
     lcd.print(line);
     strncpy(lcdBuffer[0], line, sizeof(lcdBuffer[0]) - 1);
-    lcdBuffer[0][sizeof(lcdBuffer[0]) - 1] = '\0';
   }
 
-  // Line 1: pH and Status Indicators (SAFE)
-  char mqttIndicator = ' ';
-  if (mqttState == MQTT_STATE_CONNECTED)
-    mqttIndicator = 'M';
-  else if (mqttState == MQTT_STATE_CONNECTING)
-    mqttIndicator = 'm';
-  else if (mqttState == MQTT_STATE_WAITING_RETRY)
-    mqttIndicator = '.';
+  char mqttIndicatorTB = ' ';
+  char mqttIndicatorEMQX = ' ';
 
-  snprintf(line, LCD_BUFFER_SIZE, "pH: %s         %c%c%c",
+  if (mqttStateTB == MQTT_STATE_CONNECTED)
+    mqttIndicatorTB = 'B'; // B for ThingsBoard
+  else if (mqttStateTB == MQTT_STATE_CONNECTING)
+    mqttIndicatorTB = 'b';
+
+  if (mqttStateEMQX == MQTT_STATE_CONNECTED)
+    mqttIndicatorEMQX = 'E'; // E for EMQX
+  else if (mqttStateEMQX == MQTT_STATE_CONNECTING)
+    mqttIndicatorEMQX = 'e';
+
+  snprintf(line, LCD_BUFFER_SIZE, "pH: %s        %c%c%c%c",
            phStr,
-           wifiConnected ? 'W' : ' ',
-           mqttIndicator,
-           timesynced ? 'T' : ' ');
+           wifiConnected ? 'W' : ' ', // W for WiFi
+           mqttIndicatorEMQX,
+           mqttIndicatorTB,
+           timesynced ? 'T' : ' '); // T for Time synced
 
   if (strcmp(line, lcdBuffer[1]) != 0)
   {
     lcd.setCursor(0, 1);
     lcd.print(line);
     strncpy(lcdBuffer[1], line, sizeof(lcdBuffer[1]) - 1);
-    lcdBuffer[1][sizeof(lcdBuffer[1]) - 1] = '\0';
   }
 
-  // Line 2: Target Temperature and Peltier Status (SAFE)
   snprintf(line, LCD_BUFFER_SIZE, "Target:%sC     %c ",
-           targetStr, peltierOn ? 'P' : ' ');
+           targetStr, peltierOn ? 'P' : ' '); // P for Peltier ON
 
   if (strcmp(line, lcdBuffer[2]) != 0)
   {
     lcd.setCursor(0, 2);
     lcd.print(line);
     strncpy(lcdBuffer[2], line, sizeof(lcdBuffer[2]) - 1);
-    lcdBuffer[2][sizeof(lcdBuffer[2]) - 1] = '\0';
   }
 
-  // Line 3: Feeding Count (SAFE, with blink effect)
   if (feedingBlinkActive && !feedingBlinkState)
   {
     snprintf(line, LCD_BUFFER_SIZE, "Feed:               ");
@@ -1350,7 +1462,6 @@ void displayNormalStatus()
     lcd.setCursor(0, 3);
     lcd.print(line);
     strncpy(lcdBuffer[3], line, sizeof(lcdBuffer[3]) - 1);
-    lcdBuffer[3][sizeof(lcdBuffer[3]) - 1] = '\0';
   }
 }
 
@@ -1362,31 +1473,4 @@ void setLCDNormalMode()
   {
     memset(lcdBuffer[i], 0, sizeof(lcdBuffer[i]));
   }
-}
-
-// ============================================
-// MQTT PUBLISH (SAFE)
-// ============================================
-
-void publishSensorData()
-{
-  char tempMsg[TEMP_STR_SIZE];
-  char phMsg[TEMP_STR_SIZE];
-  char statusMsg[MQTT_BUFFER_SIZE];
-
-  // Safe formatting
-  snprintf(tempMsg, sizeof(tempMsg), "%.2f", temperature);
-  mqttClient.publish(TOPIC_TEMP, tempMsg);
-
-  snprintf(phMsg, sizeof(phMsg), "%.2f", phValue);
-  mqttClient.publish(TOPIC_PH, phMsg);
-
-  publishTargetTemp();
-
-  snprintf(statusMsg, sizeof(statusMsg),
-           "{\"temperature\":%.2f,\"target_temp\":%.1f,\"ph\":%.2f,\"peltier_on\":%s,\"feeding_count\":%d}",
-           temperature, targetTemp, phValue,
-           peltierOn ? "true" : "false",
-           feedingCountToday);
-  mqttClient.publish(TOPIC_STATUS, statusMsg);
 }
