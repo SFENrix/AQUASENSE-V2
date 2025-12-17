@@ -93,12 +93,14 @@
 #define SERVO_FEED_ANGLE 30
 #define SERVO_FEED_DURATION 75
 #define SERVO_REST_ANGLE 0
+#define SERVO_DETACH_DURATION 5000
 
 // Feeding Schedule
 #define FEED_TIME_1_HOUR 8
 #define FEED_TIME_1_MIN 0
 #define FEED_TIME_2_HOUR 20
 #define FEED_TIME_2_MIN 0
+#define FEED_WINDOW_MINUTES 5
 
 // LCD Configuration
 #define LCD_ADDRESS 0x27
@@ -204,6 +206,9 @@ unsigned long lastLcdUpdate = 0;
 unsigned long lastWifiAttempt = 0;
 unsigned long lastNtpSync = 0;
 unsigned long lastDebounceTime = 0;
+unsigned long debounceTempUp = 0;
+unsigned long debounceTempDown = 0;
+unsigned long debounceFeed = 0;
 
 // Feeding Management
 int feedingCountToday = 0;
@@ -281,7 +286,7 @@ void readPH();
 void handlePeltierControl();
 void checkScheduledFeeding();
 void performFeeding(const char *source);
-bool isTimePassedToday(int targetHour, int targetMin, const struct tm &now);
+bool isWithinFeedingWindow(int targetHour, int targetMin, int windowMinutes, const struct tm &now);
 void updateServoPosition();
 void startFeedingBlink();
 void updateFeedingBlink();
@@ -1200,15 +1205,11 @@ void handlePeltierControl()
 
 // =====FEEDING=====
 
-bool isTimePassedToday(int targetHour, int targetMin, const struct tm &now)
+bool isWithinFeedingWindow(int targetHour, int targetMin, int windowMinutes, const struct tm &now)
 {
-  if (now.tm_hour > targetHour)
-    return true;
-
-  if (now.tm_hour == targetHour && now.tm_min >= targetMin)
-    return true;
-
-  return false;
+  int nowMinutes = now.tm_hour * 60 + now.tm_min;
+  int targetMinutes = targetHour * 60 + targetMin;
+  return (nowMinutes >= targetMinutes && nowMinutes <= targetMinutes + windowMinutes);
 }
 
 void checkScheduledFeeding()
@@ -1220,13 +1221,13 @@ void checkScheduledFeeding()
   int h = timeinfo.tm_hour;
   int m = timeinfo.tm_min;
 
-  if (!fed1Today && isTimePassedToday(FEED_TIME_1_HOUR, FEED_TIME_1_MIN, timeinfo))
+  if (!fed1Today && isWithinFeedingWindow(FEED_TIME_1_HOUR, FEED_TIME_1_MIN, FEED_WINDOW_MINUTES, timeinfo))
   {
     performFeeding("Schedule 08:00");
     fed1Today = true;
   }
 
-  if (!fed2Today && isTimePassedToday(FEED_TIME_2_HOUR, FEED_TIME_2_MIN, timeinfo))
+  if (!fed2Today && isWithinFeedingWindow(FEED_TIME_2_HOUR, FEED_TIME_2_MIN, FEED_WINDOW_MINUTES, timeinfo))
   {
     performFeeding("Schedule 20:00");
     fed2Today = true;
@@ -1264,7 +1265,6 @@ void performFeeding(const char *source)
   {
     feedServo.attach(PIN_SERVO, 500, 2400);
     servoAttached = true;
-    delay(100);
   }
 
   feedServo.write(SERVO_FEED_ANGLE);
@@ -1275,22 +1275,27 @@ void performFeeding(const char *source)
 
 void updateServoPosition()
 {
-  if (!servoMoving)
-    return;
+  unsigned long now = millis();
 
-  if (millis() - servoMoveStartTime >= SERVO_FEED_DURATION)
+  if (servoMoving && now - servoMoveStartTime >= SERVO_FEED_DURATION)
   {
     feedServo.write(SERVO_REST_ANGLE);
-    delay(500);
-
     servoMoving = false;
     feedingInProgress = false;
-    servoDetachTime = millis();
+    servoDetachTime = now;
 
     Serial.printf("[FEED] Complete! Count today: %d\n", feedingCountToday);
 
     publishFeedingEventToEMQX("completed");
     publishAttributesToThingsBoard();
+  }
+
+  if (servoAttached && !servoMoving && servoDetachTime > 0 &&
+      now - servoDetachTime >= SERVO_DETACH_DURATION)
+  {
+    feedServo.detach();
+    servoAttached = false;
+    servoDetachTime = 0;
   }
 }
 
@@ -1340,7 +1345,7 @@ void checkButtons()
   if (digitalRead(PIN_TEMP_UP_BTN) == LOW && !tempUpPressed)
   {
     tempUpPressed = true;
-    lastDebounceTime = millis();
+    debounceTempUp = millis();
     adjustTargetTemp(1);
   }
   else if (digitalRead(PIN_TEMP_UP_BTN) == HIGH)
@@ -1351,7 +1356,7 @@ void checkButtons()
   if (digitalRead(PIN_TEMP_DOWN_BTN) == LOW && !tempDownPressed)
   {
     tempDownPressed = true;
-    lastDebounceTime = millis();
+    debounceTempDown = millis();
     adjustTargetTemp(-1);
   }
   else if (digitalRead(PIN_TEMP_DOWN_BTN) == HIGH)
@@ -1362,7 +1367,7 @@ void checkButtons()
   if (digitalRead(PIN_MANUAL_FEED_BTN) == LOW && !manualFeedPressed)
   {
     manualFeedPressed = true;
-    lastDebounceTime = millis();
+    debounceFeed = millis();
     performFeeding("Manual Button");
   }
   else if (digitalRead(PIN_MANUAL_FEED_BTN) == HIGH)
